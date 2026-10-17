@@ -1,0 +1,7 @@
+**/__pycache__
+**/.git
+.git
+doc
+# compose や README を変えてもソースの層を作り直さないように
+docker/*.yaml
+docker/*.md

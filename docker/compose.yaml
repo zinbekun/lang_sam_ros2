@@ -1,0 +1,29 @@
+# 使い方は docker/README.md
+services:
+  lang_sam:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: lang_sam_ros2:jazzy
+    container_name: lang_sam
+    # ROS 2 (DDS) でホストや他の PC とトピックをやり取りするため
+    network_mode: host
+    ipc: host
+    # カメラ (/dev/video*) と Intel GPU (/dev/dri) をそのまま使う
+    privileged: true
+    environment:
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
+      # 重みはイメージに焼き込み済みなので Hugging Face に問い合わせない (オフラインでも即起動)
+      - HF_HUB_OFFLINE=1
+    volumes:
+      - /dev:/dev
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # params.yaml はホスト側を見る (編集してもイメージの再ビルド不要)
+      - ../lang_sam_executor/config/params.yaml:/ws/install/lang_sam_executor/share/lang_sam_executor/config/params.yaml:ro
+      # OpenVINO の GPU コンパイルキャッシュ (2 回目以降の起動が速くなる)
+      - ov_cache:/root/EdgeTAM/ov_models/cache
+
+volumes:
+  ov_cache:

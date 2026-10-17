@@ -1,0 +1,13 @@
+# WSL2 で動かすときに compose.yaml に重ねる設定
+#   docker compose -f docker/compose.yaml -f docker/compose.wsl.yaml up
+# WSL2 では GPU は /dev/dxg + /usr/lib/wsl 経由、GUI は WSLg 経由になる
+services:
+  lang_sam:
+    environment:
+      - LD_LIBRARY_PATH=/usr/lib/wsl/lib
+      - WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-wayland-0}
+      - XDG_RUNTIME_DIR=/mnt/wslg/runtime-dir
+      - PULSE_SERVER=/mnt/wslg/PulseServer
+    volumes:
+      - /usr/lib/wsl:/usr/lib/wsl:ro
+      - /mnt/wslg:/mnt/wslg

@@ -1,0 +1,21 @@
+# lang_sam_tracker ノードを動かす venv (/opt/venv) 用
+# ホストの .venv (2026-10 時点) のバージョンに合わせている
+# torch / torchvision / sam2 は Dockerfile 側で別途インストールする
+
+# cv_bridge (apt版) が numpy 1.x でビルドされているので 2.x にしない
+numpy==1.26.4
+# 5.x は numpy>=2 を要求するので numpy 1.x に対応する 4.11 系にする
+opencv-python==4.11.0.86
+pillow==12.3.0
+transformers==5.16.1
+tokenizers==0.23.2
+huggingface_hub==1.30.0
+safetensors==0.8.0
+supervision==0.30.2
+hydra-core==1.3.6
+omegaconf==2.3.1
+iopath==0.1.10
+scipy==1.13.1
+matplotlib==3.11.1
+tqdm==4.70.0
+PyYAML==6.0.3
