@@ -16,6 +16,7 @@ from lang_sam import LangSAM
 from lang_sam.utils import draw_image  # 可視化ユーティリティ
 from lang_sam.models.utils import DEVICE  # 推論デバイス（cuda/cpu取得）
 from lang_sam_msgs.msg import TrackArray, Track # カスタムメッセージ
+from lang_sam_tracker.edgetam_client import EdgeTAMClient  # EdgeTAM追跡(別プロセス)
 
 class LangSamTrackerNode(Node):
     def __init__(self):
@@ -40,6 +41,20 @@ class LangSamTrackerNode(Node):
         self.prev_gray = None
         self.next_track_id = 0
         self.latest_bgr = None  # タイマー検出用に最新フレームを保持
+
+        # EdgeTAM追跡: 検出スレッドから渡された初期化要求 (image_callback側で処理)
+        self.pending_init = None
+        self.edgetam = None
+        if self.tracker_backend == 'edgetam':
+            self.logger.info(f'Starting EdgeTAM worker ({self.edgetam_backend}, {self.edgetam_ov_device})...')
+            self.edgetam = EdgeTAMClient(
+                self.edgetam_dir,
+                python=self.edgetam_python or None,
+                backend=self.edgetam_backend,
+                ov_device=self.edgetam_ov_device,
+                ov_precision=self.edgetam_ov_precision,
+            )
+            self.logger.info(f'EdgeTAM worker ready: {self.edgetam.info}')
 
         # 共有状態ロックと検出用スレッドプール
         self.state_lock = threading.Lock()
@@ -74,6 +89,7 @@ class LangSamTrackerNode(Node):
         self.get_logger().info(f'Using text prompt: {self.text_prompt}')
         self.get_logger().info(f'Detection interval (sec): {self.detection_interval_sec}')
         self.get_logger().info(f'Image topic: {self.image_topic}')
+        self.get_logger().info(f'Tracker backend: {self.tracker_backend}')
         self.get_logger().info('LangSAM model initialized.')
 
     # パラメータ取得用の関数
@@ -85,6 +101,16 @@ class LangSamTrackerNode(Node):
         self.declare_parameter('text_threshold', 0.25)
         self.declare_parameter('detection_interval_sec', 2.0)
         self.declare_parameter('image_topic', '/camera/image_raw')
+        self.declare_parameter('tracker_backend', 'klt')     # 'klt' or 'edgetam'
+
+        # EdgeTAMのROSパラメータ (tracker_backend: edgetam のとき使用)
+        self.declare_parameter('edgetam_dir', '~/EdgeTAM')
+        self.declare_parameter('edgetam_python', '')          # 空なら <edgetam_dir>/.venv/bin/python
+        self.declare_parameter('edgetam_backend', 'openvino') # 'openvino' or 'torch'
+        self.declare_parameter('edgetam_ov_device', 'GPU')
+        self.declare_parameter('edgetam_ov_precision', 'f16')
+        self.declare_parameter('edgetam_max_objects', 3)
+        self.declare_parameter('edgetam_init_with_mask', True)
 
         # KLT(LK光学フロー)のROSパラメータ
         # - 窓サイズ、ピラミッド段数、収束条件、最低存続点数
@@ -105,6 +131,17 @@ class LangSamTrackerNode(Node):
         self.text_threshold = self.get_parameter('text_threshold').get_parameter_value().double_value
         self.detection_interval_sec = self.get_parameter('detection_interval_sec').get_parameter_value().double_value
         self.image_topic = self.get_parameter('image_topic').get_parameter_value().string_value
+        self.tracker_backend = self.get_parameter('tracker_backend').get_parameter_value().string_value
+        if self.tracker_backend not in ('klt', 'edgetam'):
+            raise ValueError(f"tracker_backend は 'klt' か 'edgetam': {self.tracker_backend}")
+
+        self.edgetam_dir = self.get_parameter('edgetam_dir').get_parameter_value().string_value
+        self.edgetam_python = self.get_parameter('edgetam_python').get_parameter_value().string_value
+        self.edgetam_backend = self.get_parameter('edgetam_backend').get_parameter_value().string_value
+        self.edgetam_ov_device = self.get_parameter('edgetam_ov_device').get_parameter_value().string_value
+        self.edgetam_ov_precision = self.get_parameter('edgetam_ov_precision').get_parameter_value().string_value
+        self.edgetam_max_objects = int(self.get_parameter('edgetam_max_objects').get_parameter_value().integer_value)
+        self.edgetam_init_with_mask = self.get_parameter('edgetam_init_with_mask').get_parameter_value().bool_value
 
         # KLTパラメータの取得と整形
         ws = self.get_parameter('klt_win_size').get_parameter_value().integer_array_value
@@ -275,21 +312,72 @@ class LangSamTrackerNode(Node):
         self.tracks = new_tracks
         self.prev_gray = gray
 
+    def _update_tracks_with_edgetam(self, cv_image):
+        # 検出結果があればEdgeTAMを検出フレームで初期化し、現在フレームまで追跡してマスク/bboxを更新
+        # ワーカーとの通信は重いのでロック外で行う (ワーカーを触るのはこのスレッドだけ)
+        with self.state_lock:
+            pending, self.pending_init = self.pending_init, None
+            tracks = self.tracks
+
+        try:
+            if pending is not None:
+                det_image, boxes, labels, scores, masks_bool = pending
+                # マスクのある検出だけをスコア順に最大 edgetam_max_objects 個追跡する
+                idx = [i for i in range(len(boxes)) if i < masks_bool.shape[0] and masks_bool[i].any()]
+                idx = sorted(idx, key=lambda i: -(scores[i] if i < len(scores) else 0.0))
+                idx = idx[:max(1, self.edgetam_max_objects)]
+                # 検出0件 (対象が画面外など) のときは初期化せず、EdgeTAMの追跡を続ける
+                if idx:
+                    tracks = []
+                    init_masks = [masks_bool[i] for i in idx] if self.edgetam_init_with_mask else None
+                    self.edgetam.init(det_image, [boxes[i] for i in idx], init_masks)
+                    for i in idx:
+                        tracks.append({
+                            'id': self.next_track_id,
+                            'label': labels[i] if i < len(labels) else 'obj',
+                            'score': float(scores[i]) if i < len(scores) else 1.0,
+                            'box': [int(v) for v in boxes[i]],
+                            'mask': masks_bool[i],
+                            'visible': True,
+                        })
+                        self.next_track_id += 1
+
+            if tracks:
+                for track, (mask, visible) in zip(tracks, self.edgetam.track(cv_image)):
+                    # 隠れた/画面外の物体もトラックに残して追跡を続ける (EdgeTAMのメモリで再び出てきたら復帰する)
+                    # 見えていない間は表示・配信しない
+                    track['visible'] = bool(visible and mask.any())
+                    if track['visible']:
+                        ys, xs = np.where(mask)
+                        track['box'] = [int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max())]
+                        track['mask'] = mask
+        except RuntimeError as e:
+            self.get_logger().error(f'EdgeTAM追跡で例外: {e}')
+            tracks = []
+
+        with self.state_lock:
+            self.tracks = tracks
+
     def image_callback(self, msg):
         # 入力: ROS Image -> OpenCV(BGR)
         cv_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
         # タイマー検出用に最新フレームを保持
         self.latest_bgr = cv_image
 
+        if self.edgetam is not None:
+            self._update_tracks_with_edgetam(cv_image)
+
         # KLT更新は共有状態を保護
         with self.state_lock:
-            self._update_tracks_with_klt(cv_image)
+            if self.edgetam is None:
+                self._update_tracks_with_klt(cv_image)
             # 可視化用にスナップショットを作る（ロック時間を短くするため必要最小限をコピー）
-            if self.tracks:
-                boxes_for_draw = np.asarray([t['box'] for t in self.tracks], dtype=np.int32)
-                labels_for_draw = [t['label'] for t in self.tracks]
-                scores_for_draw = np.asarray([t['score'] for t in self.tracks], dtype=np.float32)
-                masks_for_draw = np.asarray([t['mask'] for t in self.tracks], dtype=bool)
+            visible_tracks = [t for t in self.tracks if t.get('visible', True)]
+            if visible_tracks:
+                boxes_for_draw = np.asarray([t['box'] for t in visible_tracks], dtype=np.int32)
+                labels_for_draw = [t['label'] for t in visible_tracks]
+                scores_for_draw = np.asarray([t['score'] for t in visible_tracks], dtype=np.float32)
+                masks_for_draw = np.asarray([t['mask'] for t in visible_tracks], dtype=bool)
             else:
                 h, w, _ = cv_image.shape
                 boxes_for_draw = np.zeros((0, 4), dtype=np.int32)
@@ -390,6 +478,8 @@ class LangSamTrackerNode(Node):
         msg_tracks.header.frame_id = 'camera'
         with self.state_lock:
             for t in self.tracks:
+                if not t.get('visible', True):
+                    continue
                 tr = Track()
                 tr.id = int(t['id'])
                 tr.label = str(t['label'])
@@ -464,13 +554,17 @@ class LangSamTrackerNode(Node):
                 # 可視化保存 (コピーして共有)
                 self.latest_det_vis = det_image_cv.copy()
                 # トラック初期化
-                self._init_tracks_from_detections(
-                    cv_image,
-                    boxes_np.tolist(),
-                    labels_det,
-                    scores_np.tolist(),
-                    masks_np
-                )
+                if self.edgetam is not None:
+                    # EdgeTAMの初期化はワーカーを使うimage_callback側で行う
+                    self.pending_init = (cv_image, boxes_np.tolist(), labels_det, scores_np.tolist(), masks_np)
+                else:
+                    self._init_tracks_from_detections(
+                        cv_image,
+                        boxes_np.tolist(),
+                        labels_det,
+                        scores_np.tolist(),
+                        masks_np
+                    )
         except Exception as e:
             self.get_logger().error(f'バックグラウンド検出で例外: {e}')
         finally:
@@ -489,6 +583,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        if node.edgetam is not None:
+            node.edgetam.close()
         node.destroy_node()
         # OpenCV ウィンドウを破棄
         try:

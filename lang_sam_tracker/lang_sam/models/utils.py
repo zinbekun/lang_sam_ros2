@@ -8,6 +8,8 @@ def get_device_type() -> str:
         return "mps"
     elif torch.cuda.is_available():
         return "cuda"
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        return "xpu"
     else:
         logging.warning("No GPU found, using CPU instead")
         return "cpu"

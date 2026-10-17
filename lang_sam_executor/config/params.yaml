@@ -2,11 +2,21 @@ lang_sam_tracker:
   ros__parameters:
     # LangSAM
     sam_model: sam2.1_hiera_small
-    text_prompt: "person."
+    text_prompt: "person"
     box_threshold: 0.3            # 検出(BBox)の信頼度閾値。↑で厳格、↓で検出増(誤検出も増)
     text_threshold: 0.25          # テキスト一致の閾値。↑で厳格、↓で検出増
     detection_interval_sec: 2.0   # 再検出間隔(秒)。↓で頻繁に再検出(計算増)、↑でKLT主体
-    image_topic: /zed_node/rgb/image_rect_color  # 画像トピック名
+    image_topic: /image_raw  # 画像トピック名
+    tracker_backend: edgetam      # 検出間の追跡方法。klt: 特徴点(KLT)追跡、edgetam: EdgeTAMによるマスク追跡
+
+    # EdgeTAM (tracker_backend: edgetam のとき使用。EdgeTAMは別venvのプロセスで動く)
+    edgetam_dir: ~/EdgeTAM        # EdgeTAMリポジトリ。事前に export_openvino.py で ov_models/ を作っておく
+    edgetam_python: ""            # 空なら <edgetam_dir>/.venv/bin/python
+    edgetam_backend: openvino     # openvino / torch
+    edgetam_ov_device: GPU        # OpenVINOの実行デバイス (GPU / CPU)
+    edgetam_ov_precision: f16     # f16 / f32 (CPUならbf16も可)
+    edgetam_max_objects: 3        # 同時に追跡する最大物体数(スコア上位)。物体数に比例して重くなる
+    edgetam_init_with_mask: true  # true: LangSAMのマスクで初期化、false: BBoxをプロンプトにしてEdgeTAMで分割
     
     # KLT (LK Optical Flow)
     klt_win_size: [21, 21]        # 追跡窓(px)。大きいほど頑健/遅い。速い/大きな動き→[21,21]〜[31,31]、小物→[11,11]〜[15,15]
@@ -24,3 +34,11 @@ lang_sam_person_following:
   ros__parameters:
     image_width: 640   # 画像の幅（使用）
     kp_angular: 0.002  # 角速度の比例ゲイン（使用）
+usb_cam:
+  ros__parameters:
+    video_device: /dev/video0
+    # WSL2(usbipd)ではYUYV非圧縮だと帯域不足で画像下部が欠ける(緑になる)ためMJPEGを使用
+    pixel_format: mjpeg2rgb
+    image_width: 640
+    image_height: 480
+    framerate: 30.0

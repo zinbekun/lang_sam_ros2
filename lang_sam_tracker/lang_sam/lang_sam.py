@@ -54,7 +54,12 @@ class LangSAM:
                 "mask_scores": [],
             }
 
-            if result["labels"]:
+            # transformers 5.x は検出 0 件でも labels に [''] を返すので boxes で判定し、
+            # boxes と数が合うように labels も空にする
+            if len(processed_result["boxes"]) == 0:
+                processed_result["labels"] = []
+                processed_result["text_labels"] = []
+            else:
                 sam_images.append(np.asarray(images_pil[idx]))
                 sam_boxes.append(processed_result["boxes"])
                 sam_indices.append(idx)
